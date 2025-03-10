@@ -1,3 +1,9 @@
+"""
+JSONFormer: A powerful tool for generating structured JSON data using language models.
+This module provides the core functionality for generating JSON objects that conform
+to a specified JSON schema, using a pre-trained language model for generation.
+"""
+
 from typing import List, Union, Dict, Any
 
 from jsonformer.logits_processors import (
@@ -9,10 +15,21 @@ from termcolor import cprint
 from transformers import PreTrainedModel, PreTrainedTokenizer
 import json
 
+# Marker used to track the current generation position in the JSON structure
 GENERATION_MARKER = "|GENERATION|"
 
 
 class Jsonformer:
+    """
+    A class that generates JSON data using a language model while conforming to a specified schema.
+    
+    This class orchestrates the generation of JSON objects by breaking down the schema
+    into individual components (strings, numbers, booleans, arrays, objects) and using
+    specialized generation strategies for each type.
+    
+    Attributes:
+        value (Dict[str, Any]): The current state of the generated JSON object
+    """
     value: Dict[str, Any] = {}
 
     def __init__(
@@ -28,11 +45,26 @@ class Jsonformer:
         temperature: float = 1.0,
         max_string_token_length: int = 10,
     ):
+        """
+        Initialize the Jsonformer with a model, tokenizer, schema, and generation parameters.
+        
+        Args:
+            model: The pre-trained language model to use for generation
+            tokenizer: The tokenizer corresponding to the model
+            json_schema: The JSON schema that defines the structure to generate
+            prompt: The input prompt to guide the generation
+            debug: Whether to print debug information during generation
+            max_array_length: Maximum number of elements in generated arrays
+            max_number_tokens: Maximum tokens for generating numbers
+            temperature: Sampling temperature for generation (higher = more random)
+            max_string_token_length: Maximum tokens for generating strings
+        """
         self.model = model
         self.tokenizer = tokenizer
         self.json_schema = json_schema
         self.prompt = prompt
 
+        # Initialize the number generation logits processor
         self.number_logit_processor = OutputNumbersTokens(self.tokenizer, self.prompt)
 
         self.generation_marker = "|GENERATION|"
@@ -44,6 +76,7 @@ class Jsonformer:
         self.max_string_token_length = max_string_token_length
 
     def debug(self, caller: str, value: str, is_prompt: bool = False):
+        """Print debug information if debug mode is enabled."""
         if self.debug_on:
             if is_prompt:
                 cprint(caller, "green", end=" ")
@@ -53,6 +86,22 @@ class Jsonformer:
                 cprint(value, "blue")
 
     def generate_number(self, temperature: Union[float, None] = None, iterations=0):
+        """
+        Generate a numeric value using the language model.
+        
+        Uses the NumberStoppingCriteria to ensure valid number generation and
+        supports decimal numbers with controlled precision.
+        
+        Args:
+            temperature: Optional override for generation temperature
+            iterations: Number of retry attempts for invalid generations
+            
+        Returns:
+            float: The generated number
+            
+        Raises:
+            ValueError: If unable to generate a valid number after max retries
+        """
         prompt = self.get_prompt()
         self.debug("[generate_number]", prompt, is_prompt=True)
         input_tokens = self.tokenizer.encode(prompt, return_tensors="pt").to(
@@ -71,6 +120,7 @@ class Jsonformer:
         )
         response = self.tokenizer.decode(response[0], skip_special_tokens=True)
 
+        # Extract just the generated number from the full response
         response = response[len(prompt) :]
         response = response.strip().rstrip(".")
         self.debug("[generate_number]", response)
@@ -79,10 +129,16 @@ class Jsonformer:
         except ValueError:
             if iterations > 3:
                 raise ValueError("Failed to generate a valid number")
-
+            # Retry with higher temperature for more variety
             return self.generate_number(temperature=self.temperature * 1.3, iterations=iterations+1)
 
     def generate_boolean(self) -> bool:
+        """
+        Generate a boolean value by comparing logits for 'true' and 'false' tokens.
+        
+        Returns:
+            bool: The generated boolean value
+        """
         prompt = self.get_prompt()
         self.debug("[generate_boolean]", prompt, is_prompt=True)
 
@@ -90,9 +146,8 @@ class Jsonformer:
         output = self.model.forward(input_tensor.to(self.model.device))
         logits = output.logits[0, -1]
 
-        # todo: this assumes that "true" and "false" are both tokenized to a single token
-        # this is probably not true for all tokenizers
-        # this can be fixed by looking at only the first token of both "true" and "false"
+        # Compare logits for true/false tokens to make decision
+        # TODO: Handle cases where true/false are multi-token
         true_token_id = self.tokenizer.convert_tokens_to_ids("true")
         false_token_id = self.tokenizer.convert_tokens_to_ids("false")
 
@@ -103,6 +158,16 @@ class Jsonformer:
         return result.item()
 
     def generate_string(self) -> str:
+        """
+        Generate a string value using the language model.
+        
+        Uses StringStoppingCriteria to ensure the string is properly terminated
+        with a quote character.
+        
+        Returns:
+            str: The generated string value
+        """
+        # Start with opening quote
         prompt = self.get_prompt() + '"'
         self.debug("[generate_string]", prompt, is_prompt=True)
         input_tokens = self.tokenizer.encode(prompt, return_tensors="pt").to(
@@ -120,8 +185,7 @@ class Jsonformer:
             pad_token_id=self.tokenizer.eos_token_id,
         )
 
-        # Some models output the prompt as part of the response
-        # This removes the prompt from the response if it is present
+        # Handle models that may include the prompt in their output
         if (
             len(response[0]) >= len(input_tokens[0])
             and (response[0][: len(input_tokens[0])] == input_tokens).all()
@@ -134,6 +198,7 @@ class Jsonformer:
 
         self.debug("[generate_string]", "|" + response + "|")
 
+        # Extract string content between quotes if present
         if response.count('"') < 1:
             return response
 
@@ -142,6 +207,16 @@ class Jsonformer:
     def generate_object(
         self, properties: Dict[str, Any], obj: Dict[str, Any]
     ) -> Dict[str, Any]:
+        """
+        Generate a JSON object by recursively generating values for each property.
+        
+        Args:
+            properties: Schema properties defining the object structure
+            obj: The object being populated with generated values
+            
+        Returns:
+            Dict[str, Any]: The generated object with all properties filled
+        """
         for key, schema in properties.items():
             self.debug("[generate_object] generating value for", key)
             obj[key] = self.generate_value(schema, obj, key)
@@ -153,6 +228,23 @@ class Jsonformer:
         obj: Union[Dict[str, Any], List[Any]],
         key: Union[str, None] = None,
     ) -> Any:
+        """
+        Generate a value based on the schema type.
+        
+        This is the core dispatch method that routes to the appropriate generator
+        based on the schema type (number, boolean, string, array, object).
+        
+        Args:
+            schema: The schema defining the value type and constraints
+            obj: The parent object/array being populated
+            key: The key in the parent object (if applicable)
+            
+        Returns:
+            Any: The generated value matching the schema type
+            
+        Raises:
+            ValueError: If the schema type is not supported
+        """
         schema_type = schema["type"]
         if schema_type == "number":
             if key:
@@ -187,11 +279,25 @@ class Jsonformer:
             raise ValueError(f"Unsupported schema type: {schema_type}")
 
     def generate_array(self, item_schema: Dict[str, Any], obj: Dict[str, Any]) -> list:
+        """
+        Generate an array of values conforming to the item schema.
+        
+        Uses the language model to determine when to stop generating array elements
+        by looking at the likelihood of comma vs closing bracket tokens.
+        
+        Args:
+            item_schema: Schema defining the type of items in the array
+            obj: The array being populated
+            
+        Returns:
+            list: The generated array with all elements
+        """
         for _ in range(self.max_array_length):
-            # forces array to have at least one element
+            # Generate at least one element
             element = self.generate_value(item_schema, obj)
             obj[-1] = element
 
+            # Check if we should continue generating elements
             obj.append(self.generation_marker)
             input_prompt = self.get_prompt()
             obj.pop()
@@ -199,7 +305,7 @@ class Jsonformer:
             output = self.model.forward(input_tensor.to(self.model.device))
             logits = output.logits[0, -1]
 
-
+            # Look at top token probabilities to decide whether to continue
             top_indices = logits.topk(30).indices
             sorted_token_ids = top_indices[logits[top_indices].argsort(descending=True)]
 
@@ -215,12 +321,22 @@ class Jsonformer:
                     found_close_bracket = True
                     break
 
+            # Stop if we're more likely to close the array than continue
             if found_close_bracket or not found_comma:
                 break
 
         return obj
 
     def get_prompt(self):
+        """
+        Build the generation prompt by combining the user prompt, schema, and current progress.
+        
+        Returns:
+            str: The formatted prompt for the next generation step
+        
+        Raises:
+            ValueError: If the generation marker is not found in the current state
+        """
         template = """{prompt}\nOutput result in the following JSON schema format:\n{schema}\nResult: {progress}"""
         progress = json.dumps(self.value)
         gen_marker_index = progress.find(f'"{self.generation_marker}"')
@@ -238,6 +354,14 @@ class Jsonformer:
         return prompt
 
     def __call__(self) -> Dict[str, Any]:
+        """
+        Generate a complete JSON object conforming to the schema.
+        
+        This is the main entry point for using the Jsonformer.
+        
+        Returns:
+            Dict[str, Any]: The complete generated JSON object
+        """
         self.value = {}
         generated_data = self.generate_object(
             self.json_schema["properties"], self.value
